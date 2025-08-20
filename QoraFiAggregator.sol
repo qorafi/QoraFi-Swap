@@ -9,24 +9,12 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 // Use existing libraries  
 import "../libraries/SwapUtilities.sol";
 
-// V3 Handler Interface
-interface IQoraFiV3Handler {
-    struct V3Quote {
-        uint256 amountOut;
-        uint24 fee;
-        uint256 gasEstimate;
-        bool isValid;
-    }
-    
-    function getBestV3Quote(address tokenIn, address tokenOut, uint256 amountIn) external returns (V3Quote memory);
-    function executeV3Swap(bytes32 dexKey, address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint256 amountOutMinimum, address recipient, uint256 deadline) external returns (uint256);
-    function getV3DEXCount() external view returns (uint256);
-}
+// V3Handler removed - focusing on V2 aggregation only
 
 /**
  * @title QoraFiAggregator
- * @notice Advanced DEX aggregator with multi-hop optimization and V2/V3 support
- * @dev Separate contract for advanced features to keep main router lightweight
+ * @notice Streamlined DEX aggregator with V2 support and direct native swaps
+ * @dev Focused on essential aggregation without V3 complexity
  */
 contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
     
@@ -46,7 +34,6 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
     struct TradeRoute {
         bytes32[] dexKeys;
         address[] tokens;
-        uint24[] fees; // For V3 pools
         uint256 expectedOutput;
         uint256 gasEstimate;
     }
@@ -68,14 +55,9 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
     address public feeCollector;
     uint16 public aggregatorFeeBps; // Separate fee for aggregation service
     
-    // V3 Handler contract
-    IQoraFiV3Handler public v3Handler;
-    
-    
     // Popular token addresses for path optimization
     address public immutable WBNB;
     address public immutable USDT;
-    address public immutable BUSD;
     address[] public commonTokens;
 
     // --- EVENTS ---
@@ -94,9 +76,7 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
     constructor(
         address _wbnb,
         address _usdt, 
-        address _busd,
-        address _feeCollector,
-        address _v3Handler
+        address _feeCollector
     ) {
         require(_wbnb != address(0) && _feeCollector != address(0), "Invalid address");
         
@@ -105,9 +85,7 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
 
         WBNB = _wbnb;
         USDT = _usdt;
-        BUSD = _busd;
         feeCollector = _feeCollector;
-        v3Handler = IQoraFiV3Handler(_v3Handler);
         
         // Initialize config
         config = AggregatorConfig({
@@ -122,10 +100,9 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
         aggregatorFeeBps = 10; // 0.1% aggregation fee
         
         
-        // Set common tokens for path finding
+        // Set common tokens for path finding (WBNB and USDT only)
         commonTokens.push(_wbnb);
         commonTokens.push(_usdt);
-        commonTokens.push(_busd);
     }
 
     // --- AGGREGATION FUNCTIONS ---
@@ -210,6 +187,82 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
+     * @notice Execute optimal trade with native BNB input
+     */
+    function executeOptimalTradeNative(
+        address tokenOut,
+        uint256 minAmountOut,
+        address to,
+        uint256 deadline
+    ) external payable nonReentrant whenNotPaused {
+        require(block.timestamp <= deadline, "Deadline exceeded");
+        require(msg.value >= config.minTradeSize, "Trade too small");
+        
+        // Calculate and collect aggregator fee
+        uint256 feeAmount = (msg.value * aggregatorFeeBps) / 10000;
+        uint256 tradeAmount = msg.value - feeAmount;
+        
+        if (feeAmount > 0) {
+            (bool success,) = payable(feeCollector).call{value: feeAmount}("");
+            require(success, "Fee transfer failed");
+        }
+        
+        // Find optimal route for BNB->Token
+        TradeRoute memory route = this.findOptimalRoute(WBNB, tokenOut, tradeAmount);
+        
+        // Execute using BNB directly
+        uint256 finalOutput = _executeNativeToTokenTrade(route, tradeAmount, tokenOut, deadline);
+        
+        // Verify minimum output
+        require(finalOutput >= minAmountOut, "Insufficient output");
+        
+        // Transfer output tokens to recipient  
+        IERC20(tokenOut).transfer(to, finalOutput);
+        
+        emit MultiHopTradeExecuted(msg.sender, route.tokens, tradeAmount, finalOutput);
+    }
+
+    /**
+     * @notice Execute optimal trade with native BNB output  
+     */
+    function executeOptimalTradeToNative(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address to,
+        uint256 deadline
+    ) external nonReentrant whenNotPaused {
+        require(block.timestamp <= deadline, "Deadline exceeded");
+        require(amountIn >= config.minTradeSize, "Trade too small");
+        
+        // Transfer input tokens
+        IERC20(tokenIn).transferFrom(msg.sender, address(this), amountIn);
+        
+        // Calculate and collect aggregator fee
+        uint256 feeAmount = (amountIn * aggregatorFeeBps) / 10000;
+        uint256 tradeAmount = amountIn - feeAmount;
+        
+        if (feeAmount > 0) {
+            IERC20(tokenIn).transfer(feeCollector, feeAmount);
+        }
+        
+        // Find optimal route for Token->BNB
+        TradeRoute memory route = this.findOptimalRoute(tokenIn, WBNB, tradeAmount);
+        
+        // Execute swap directly to native BNB (no WBNB wrapping needed)
+        uint256 nativeReceived = _executeTokenToNativeTrade(route, tradeAmount, tokenIn, deadline);
+        
+        // Verify minimum output
+        require(nativeReceived >= minAmountOut, "Insufficient output");
+        
+        // Send BNB to recipient
+        (bool success,) = payable(to).call{value: nativeReceived}("");
+        require(success, "BNB transfer failed");
+        
+        emit MultiHopTradeExecuted(msg.sender, route.tokens, tradeAmount, nativeReceived);
+    }
+
+    /**
      * @notice Get quote with multi-hop optimization
      */
     function getOptimalQuote(
@@ -224,40 +277,7 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
         gasEstimate = route.gasEstimate;
     }
 
-    /**
-     * @notice Get optimal quote including V3 (non-view due to V3 quoter limitations)
-     */
-    function getOptimalQuoteWithV3(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn
-    ) external returns (uint256 amountOut, uint256 gasEstimate, bool isV3) {
-        // Get V2 quote first
-        TradeRoute memory v2Route = this.findOptimalRoute(tokenIn, tokenOut, amountIn);
-        uint256 v2AmountOut = (v2Route.expectedOutput * (10000 - aggregatorFeeBps)) / 10000;
-        
-        uint256 bestAmountOut = v2AmountOut;
-        uint256 bestGasEstimate = v2Route.gasEstimate;
-        bool useV3 = false;
-        
-        // Try V3 if handler is available
-        if (address(v3Handler) != address(0)) {
-            try v3Handler.getBestV3Quote(tokenIn, tokenOut, amountIn) returns (IQoraFiV3Handler.V3Quote memory v3Quote) {
-                if (v3Quote.isValid && v3Quote.amountOut > 0) {
-                    uint256 v3AmountOutAfterFee = (v3Quote.amountOut * (10000 - aggregatorFeeBps)) / 10000;
-                    if (v3AmountOutAfterFee > bestAmountOut) {
-                        bestAmountOut = v3AmountOutAfterFee;
-                        bestGasEstimate = v3Quote.gasEstimate;
-                        useV3 = true;
-                    }
-                }
-            } catch {
-                // V3 failed, use V2
-            }
-        }
-        
-        return (bestAmountOut, bestGasEstimate, useV3);
-    }
+    // V3 functions removed - focusing on V2 aggregation only
 
     // --- INTERNAL FUNCTIONS ---
 
@@ -276,25 +296,22 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
             
             if (!dex.isActive) continue;
             
-            // Only handle V2 DEXs here - V3 handled by separate contract
-            if (dex.dexType == 0) { // V2
-                uint256 expectedOut = SwapLib.getExpectedSwapOutput(
-                    dex.routerAddress,
-                    tokenIn,
-                    tokenOut,
-                    amountIn
-                );
-                
-                if (expectedOut > 0) {
-                    routes[routeCount] = TradeRoute({
-                        dexKeys: _createSingleDEXArray(dexKey),
-                        tokens: _createTokenPath(tokenIn, tokenOut),
-                        fees: new uint24[](0),
-                        expectedOutput: expectedOut,
-                        gasEstimate: _estimateGasCost(1)
-                    });
-                    routeCount++;
-                }
+            // Handle all active DEX types
+            uint256 expectedOut = SwapLib.getExpectedSwapOutput(
+                dex.routerAddress,
+                tokenIn,
+                tokenOut,
+                amountIn
+            );
+            
+            if (expectedOut > 0) {
+                routes[routeCount] = TradeRoute({
+                    dexKeys: _createSingleDEXArray(dexKey),
+                    tokens: _createTokenPath(tokenIn, tokenOut),
+                    expectedOutput: expectedOut,
+                    gasEstimate: _estimateGasCost(1)
+                });
+                routeCount++;
             }
         }
         
@@ -308,22 +325,27 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
         TradeRoute[] memory routes,
         uint256 routeCount
     ) internal view returns (uint256) {
-        // Generate routes through common tokens (WBNB, USDT, BUSD)
-        for (uint256 i = 0; i < commonTokens.length && routeCount < config.maxRoutes; i++) {
-            address intermediateToken = commonTokens[i];
+        if (routeCount >= config.maxRoutes) return routeCount;
+        
+        // Try multi-hop routes using common intermediate tokens
+        address[] memory intermediates = new address[](2);
+        intermediates[0] = WBNB;
+        intermediates[1] = USDT;
+        
+        for (uint256 i = 0; i < intermediates.length && routeCount < config.maxRoutes; i++) {
+            address intermediate = intermediates[i];
             
-            if (intermediateToken == tokenIn || intermediateToken == tokenOut) continue;
+            // Skip if intermediate is same as input or output
+            if (intermediate == tokenIn || intermediate == tokenOut) continue;
             
-            // Try tokenIn -> intermediate -> tokenOut
-            uint256 bestOutput = _calculateMultiHopOutput(tokenIn, intermediateToken, tokenOut, amountIn);
+            uint256 multiHopOutput = _calculateMultiHopOutput(tokenIn, intermediate, tokenOut, amountIn);
             
-            if (bestOutput > 0) {
+            if (multiHopOutput > 0) {
                 routes[routeCount] = TradeRoute({
-                    dexKeys: new bytes32[](0), // Simplified for now
-                    tokens: _createMultiHopPath(tokenIn, intermediateToken, tokenOut),
-                    fees: new uint24[](0),
-                    expectedOutput: bestOutput,
-                    gasEstimate: _estimateGasCost(2) // Two hops
+                    dexKeys: new bytes32[](0),
+                    tokens: _createMultiHopPath(tokenIn, intermediate, tokenOut),
+                    expectedOutput: multiHopOutput,
+                    gasEstimate: _estimateGasCost(2)
                 });
                 routeCount++;
             }
@@ -338,52 +360,31 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
         address tokenOut,
         uint256 amountIn
     ) internal view returns (uint256) {
-        // Find best DEX for first hop
-        uint256 bestFirstHop = 0;
-        uint256 dexCount = activeDEXs.length;
-        
-        for (uint256 i = 0; i < dexCount; i++) {
-            bytes32 dexKey = activeDEXs[i];
-            DEXInfo storage dex = dexInfo[dexKey];
-            
-            if (!dex.isActive) continue;
-            
-            uint256 intermediateAmount = SwapLib.getExpectedSwapOutput(
-                dex.routerAddress,
-                tokenIn,
-                intermediate,
-                amountIn
-            );
-            
-            if (intermediateAmount > bestFirstHop) {
-                bestFirstHop = intermediateAmount;
-            }
+        // Find the best output for the first hop (tokenIn -> intermediate)
+        // by checking ALL active DEXs.
+        uint256 bestIntermediateAmount = 0;
+        for (uint i = 0; i < activeDEXs.length; i++) {
+             address router = dexInfo[activeDEXs[i]].routerAddress;
+             uint256 intermediateAmount = SwapLib.getExpectedSwapOutput(router, tokenIn, intermediate, amountIn);
+             if (intermediateAmount > bestIntermediateAmount) {
+                 bestIntermediateAmount = intermediateAmount;
+             }
         }
-        
-        if (bestFirstHop == 0) return 0;
-        
-        // Find best DEX for second hop
-        uint256 bestSecondHop = 0;
-        
-        for (uint256 i = 0; i < dexCount; i++) {
-            bytes32 dexKey = activeDEXs[i];
-            DEXInfo storage dex = dexInfo[dexKey];
-            
-            if (!dex.isActive) continue;
-            
-            uint256 finalAmount = SwapLib.getExpectedSwapOutput(
-                dex.routerAddress,
-                intermediate,
-                tokenOut,
-                bestFirstHop
-            );
-            
-            if (finalAmount > bestSecondHop) {
-                bestSecondHop = finalAmount;
-            }
+
+        if (bestIntermediateAmount == 0) return 0;
+
+        // Find the best output for the second hop (intermediate -> tokenOut)
+        // by checking ALL active DEXs.
+        uint256 bestFinalAmount = 0;
+        for (uint i = 0; i < activeDEXs.length; i++) {
+             address router = dexInfo[activeDEXs[i]].routerAddress;
+             uint256 finalAmount = SwapLib.getExpectedSwapOutput(router, intermediate, tokenOut, bestIntermediateAmount);
+             if (finalAmount > bestFinalAmount) {
+                 bestFinalAmount = finalAmount;
+             }
         }
-        
-        return bestSecondHop;
+
+        return bestFinalAmount;
     }
 
     function _selectBestRoute(
@@ -485,12 +486,76 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Update V3Handler address
+     * @notice Execute native BNB to token trade using SwapLib
      */
-    function setV3Handler(address _v3Handler) external onlyRole(GOVERNANCE_ROLE) {
-        require(_v3Handler != address(0), "Invalid V3Handler");
-        v3Handler = IQoraFiV3Handler(_v3Handler);
+    function _executeNativeToTokenTrade(
+        TradeRoute memory route,
+        uint256 amountIn,
+        address tokenOut,
+        uint256 deadline
+    ) internal returns (uint256 finalAmount) {
+        // Find best DEX for this swap
+        bytes32 bestDEX = activeDEXs[0]; // Use first DEX for now
+        address router = dexInfo[bestDEX].routerAddress;
+        
+        // Check if multi-hop is needed
+        if (route.tokens.length > 2) {
+            // Multi-hop: BNB -> USDT -> QOR (direct, no WBNB conversion)
+            finalAmount = SwapLib.executeMultiHopETHToTokenSwap(
+                router,
+                route.tokens, // e.g., [WBNB, USDT, QOR] but WBNB gets replaced with native
+                amountIn,
+                0, // No minimum for internal calculation
+                deadline
+            );
+        } else {
+            // Single hop: BNB -> Token
+            finalAmount = SwapLib.executeETHToTokenSwap(
+                router,
+                tokenOut,
+                amountIn,
+                0, // No minimum for internal calculation
+                deadline
+            );
+        }
+        
+        // Update DEX statistics
+        dexInfo[bestDEX].successfulTrades++;
+        dexInfo[bestDEX].totalVolume += amountIn;
+        
+        return finalAmount;
     }
+
+    /**
+     * @notice Execute token to native BNB trade using SwapLib
+     */
+    function _executeTokenToNativeTrade(
+        TradeRoute memory /* route */,
+        uint256 amountIn,
+        address tokenIn,
+        uint256 deadline
+    ) internal returns (uint256 nativeAmount) {
+        // Find best DEX for this swap
+        bytes32 bestDEX = activeDEXs[0]; // Use first DEX for now
+        address router = dexInfo[bestDEX].routerAddress;
+        
+        // Execute token to ETH swap using SwapLib
+        nativeAmount = SwapLib.executeTokenToETHSwap(
+            router,
+            tokenIn,
+            amountIn,
+            0, // No minimum for internal calculation
+            deadline
+        );
+        
+        // Update DEX statistics
+        dexInfo[bestDEX].successfulTrades++;
+        dexInfo[bestDEX].totalVolume += amountIn;
+        
+        return nativeAmount;
+    }
+
+    // V3Handler functions removed
 
     // --- ADMIN FUNCTIONS ---
 
@@ -500,7 +565,7 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
         uint8 dexType
     ) external onlyRole(AGGREGATOR_MANAGER_ROLE) {
         require(routerAddress != address(0), "Invalid router");
-        require(dexType == 0 || dexType == 2, "Use V3Handler for V3 DEXs"); // Only V2 or Custom
+        // Accept any DEX type - no longer restricted to V2 only
         if (dexInfo[key].routerAddress != address(0)) revert InvalidDEX();
         
         dexInfo[key] = DEXInfo({
@@ -654,27 +719,7 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
         _unpause();
     }
 
-    /**
-     * @notice Get aggregator performance metrics
-     */
-    function getPerformanceMetrics() external view returns (
-        uint256 totalDEXs,
-        uint256 activeDEXCount,
-        uint256 totalTrades,
-        uint256 totalVolume,
-        uint16 currentFee
-    ) {
-        totalDEXs = activeDEXs.length;
-        
-        for (uint256 i = 0; i < activeDEXs.length; i++) {
-            DEXInfo storage dex = dexInfo[activeDEXs[i]];
-            if (dex.isActive) activeDEXCount++;
-            totalTrades += dex.successfulTrades;
-            totalVolume += dex.totalVolume;
-        }
-        
-        currentFee = aggregatorFeeBps;
-    }
+    // Performance metrics removed to reduce contract size
 
     /**
      * @notice Recover accidentally sent tokens
@@ -711,4 +756,8 @@ contract QoraFiAggregator is AccessControl, ReentrancyGuard, Pausable {
         );
     }
 
+    /**
+     * @notice Allow contract to receive native BNB
+     */
+    receive() external payable {}
 }

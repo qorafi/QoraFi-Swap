@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
@@ -29,6 +30,7 @@ interface IRouterExtended {
  * @dev Uses SwapLib and MEVLib for core functionality
  */
 contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
     
     // --- ROLES ---
     bytes32 public constant GOVERNANCE_ROLE = DEFAULT_ADMIN_ROLE;
@@ -63,11 +65,10 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
 
     // --- ERRORS ---
     error DeadlineExpired();
-    error InsufficientOutput();
-    error InvalidRouter();
     error RouterExists();
     error NoRoutersAvailable();
     error InvalidFee();
+    // Note: InsufficientOutput and InvalidRouter are defined in SwapUtilities library
 
     constructor(
         address _initialRouter,
@@ -121,7 +122,7 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
         
         // Verify expected output after fee
         uint256 expectedAfterFee = (expectedOut * (10000 - feePercentBps)) / 10000;
-        if (expectedAfterFee < amountOutMin) revert InsufficientOutput();
+        if (expectedAfterFee < amountOutMin) revert SwapLib.InsufficientOutput();
         
         // Send fee to treasury
         if (feeAmount > 0) {
@@ -130,15 +131,29 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
             emit FeeCollected(msg.sender, WBNB, feeAmount);
         }
         
-        // Execute swap using SwapLib
+        // Execute swap using SwapLib (handle both single-hop and multi-hop)
         address router = routers[bestRouterKey].routerAddress;
-        uint256 amountOut = SwapLib.executeETHToTokenSwap(
-            router,
-            path[path.length - 1],
-            swapAmount,
-            amountOutMin,
-            deadline
-        );
+        uint256 amountOut;
+        
+        if (path.length > 2) {
+            // Multi-hop swap: BNB -> USDT -> QOR (no WBNB conversion needed)
+            amountOut = SwapLib.executeMultiHopETHToTokenSwap(
+                router,
+                path,
+                swapAmount,
+                amountOutMin,
+                deadline
+            );
+        } else {
+            // Single-hop swap: BNB -> Token
+            amountOut = SwapLib.executeETHToTokenSwap(
+                router,
+                path[path.length - 1],
+                swapAmount,
+                amountOutMin,
+                deadline
+            );
+        }
         
         // Update MEV and router stats
         MEVLib.updatePostDeposit(mevConfig, msg.sender, msg.value);
@@ -162,8 +177,9 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
     ) external nonReentrant whenNotPaused {
         if (block.timestamp > deadline) revert DeadlineExpired();
         
-        // MEV Protection
-        MEVLib.checkPreDeposit(mevConfig, msg.sender, amountIn);
+        // MEV Protection - convert token amount to native token equivalent
+        uint256 nativeEquivalent = _convertToNativeEquivalent(path[0], amountIn);
+        MEVLib.checkPreDeposit(mevConfig, msg.sender, nativeEquivalent);
         
         // Find best router
         (bytes32 bestRouterKey, uint256 expectedOut) = _findBestRoute(path, amountIn);
@@ -176,7 +192,7 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
         
         // Verify expected output
         uint256 expectedAfterFee = (expectedOut * (10000 - feePercentBps)) / 10000;
-        if (expectedAfterFee < amountOutMin) revert InsufficientOutput();
+        if (expectedAfterFee < amountOutMin) revert SwapLib.InsufficientOutput();
         
         // Send fee to treasury
         if (feeAmount > 0) {
@@ -184,19 +200,29 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
             emit FeeCollected(msg.sender, path[0], feeAmount);
         }
         
-        // Execute swap using SwapLib
+        // Execute swap using SwapLib (handle both single-hop and multi-hop)
         address router = routers[bestRouterKey].routerAddress;
-        uint256 amountOut = SwapLib.executeSwap(
-            router,
-            path[0],
-            path[path.length - 1],
+        uint256 amountOut;
+        
+        // Execute token swap using router directly with full path support
+        SafeERC20.forceApprove(IERC20(path[0]), router, swapAmount);
+        
+        try IRouterExtended(router).swapExactTokensForTokens(
             swapAmount,
             amountOutMin,
+            path,
+            address(this),
             deadline
-        );
+        ) returns (uint256[] memory amounts) {
+            amountOut = amounts[amounts.length - 1];
+            SafeERC20.forceApprove(IERC20(path[0]), router, 0);
+        } catch {
+            SafeERC20.forceApprove(IERC20(path[0]), router, 0);
+            revert("Token swap failed");
+        }
         
         // Update stats
-        MEVLib.updatePostDeposit(mevConfig, msg.sender, amountIn);
+        MEVLib.updatePostDeposit(mevConfig, msg.sender, nativeEquivalent);
         routers[bestRouterKey].successCount++;
         
         // Transfer output tokens
@@ -217,8 +243,9 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
     ) external nonReentrant whenNotPaused {
         if (block.timestamp > deadline) revert DeadlineExpired();
         
-        // MEV Protection
-        MEVLib.checkPreDeposit(mevConfig, msg.sender, amountInMax);
+        // MEV Protection - convert token amount to native token equivalent
+        uint256 nativeEquivalent = _convertToNativeEquivalent(path[0], amountInMax);
+        MEVLib.checkPreDeposit(mevConfig, msg.sender, nativeEquivalent);
         
         // Find best router and calculate required input
         (bytes32 bestRouterKey, uint256 requiredInput) = _findBestRouteForExactOutput(path, amountOut);
@@ -227,7 +254,7 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
         uint256 feeAmount = (requiredInput * feePercentBps) / 10000;
         uint256 totalInput = requiredInput + feeAmount;
         
-        if (totalInput > amountInMax) revert InsufficientOutput();
+        if (totalInput > amountInMax) revert SwapLib.InsufficientOutput();
         
         // Transfer tokens
         IERC20(path[0]).transferFrom(msg.sender, address(this), totalInput);
@@ -238,15 +265,19 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
             emit FeeCollected(msg.sender, path[0], feeAmount);
         }
         
-        // Execute swap
+        // Execute swap - approve exact amount needed
         address router = routers[bestRouterKey].routerAddress;
-        IERC20(path[0]).approve(router, requiredInput);
+        SafeERC20.forceApprove(IERC20(path[0]), router, requiredInput);
         
         try IRouterExtended(router).swapTokensForExactTokens(amountOut, requiredInput, path, to, deadline) {
+            // Reset allowance after successful swap
+            SafeERC20.forceApprove(IERC20(path[0]), router, 0);
             routers[bestRouterKey].successCount++;
             MEVLib.updatePostDeposit(mevConfig, msg.sender, totalInput);
             emit SwapExecuted(msg.sender, bestRouterKey, requiredInput, amountOut);
         } catch {
+            // Reset allowance after failed swap  
+            SafeERC20.forceApprove(IERC20(path[0]), router, 0);
             revert("Swap failed");
         }
     }
@@ -272,7 +303,7 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
         uint256 feeAmount = (requiredBNB * feePercentBps) / 10000;
         uint256 totalRequired = requiredBNB + feeAmount;
         
-        if (totalRequired > msg.value) revert InsufficientOutput();
+        if (totalRequired > msg.value) revert SwapLib.InsufficientOutput();
         
         // Send fee to treasury
         if (feeAmount > 0) {
@@ -311,8 +342,9 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
     ) external nonReentrant whenNotPaused {
         if (block.timestamp > deadline) revert DeadlineExpired();
         
-        // MEV Protection
-        MEVLib.checkPreDeposit(mevConfig, msg.sender, amountIn);
+        // MEV Protection - convert token amount to native token equivalent
+        uint256 nativeEquivalent = _convertToNativeEquivalent(path[0], amountIn);
+        MEVLib.checkPreDeposit(mevConfig, msg.sender, nativeEquivalent);
         
         // Find best router
         (bytes32 bestRouterKey, uint256 expectedOut) = _findBestRoute(path, amountIn);
@@ -323,7 +355,7 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
         
         // Verify expected output after fee
         uint256 expectedAfterFee = (expectedOut * (10000 - feePercentBps)) / 10000;
-        if (expectedAfterFee < amountOutMin) revert InsufficientOutput();
+        if (expectedAfterFee < amountOutMin) revert SwapLib.InsufficientOutput();
         
         // Transfer tokens
         IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn);
@@ -334,15 +366,19 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
             emit FeeCollected(msg.sender, path[0], feeAmount);
         }
         
-        // Execute swap
+        // Execute swap - approve exact amount needed
         address router = routers[bestRouterKey].routerAddress;
-        IERC20(path[0]).approve(router, swapAmount);
+        SafeERC20.forceApprove(IERC20(path[0]), router, swapAmount);
         
         try IRouterExtended(router).swapExactTokensForETH(swapAmount, amountOutMin, path, to, deadline) returns (uint256[] memory amounts) {
+            // Reset allowance after successful swap
+            SafeERC20.forceApprove(IERC20(path[0]), router, 0);
             routers[bestRouterKey].successCount++;
-            MEVLib.updatePostDeposit(mevConfig, msg.sender, amountIn);
+            MEVLib.updatePostDeposit(mevConfig, msg.sender, nativeEquivalent);
             emit SwapExecuted(msg.sender, bestRouterKey, swapAmount, amounts[amounts.length - 1]);
         } catch {
+            // Reset allowance after failed swap
+            SafeERC20.forceApprove(IERC20(path[0]), router, 0);
             revert("Swap failed");
         }
     }
@@ -369,7 +405,7 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
         uint256 feeAmount = (requiredInput * feePercentBps) / 10000;
         uint256 totalInput = requiredInput + feeAmount;
         
-        if (totalInput > amountInMax) revert InsufficientOutput();
+        if (totalInput > amountInMax) revert SwapLib.InsufficientOutput();
         
         // Transfer tokens
         IERC20(path[0]).transferFrom(msg.sender, address(this), totalInput);
@@ -380,15 +416,19 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
             emit FeeCollected(msg.sender, path[0], feeAmount);
         }
         
-        // Execute swap
+        // Execute swap - approve exact amount needed
         address router = routers[bestRouterKey].routerAddress;
-        IERC20(path[0]).approve(router, requiredInput);
+        SafeERC20.forceApprove(IERC20(path[0]), router, requiredInput);
         
         try IRouterExtended(router).swapTokensForExactETH(amountOut, requiredInput, path, to, deadline) {
+            // Reset allowance after successful swap
+            SafeERC20.forceApprove(IERC20(path[0]), router, 0);
             routers[bestRouterKey].successCount++;
             MEVLib.updatePostDeposit(mevConfig, msg.sender, totalInput);
             emit SwapExecuted(msg.sender, bestRouterKey, requiredInput, amountOut);
         } catch {
+            // Reset allowance after failed swap
+            SafeERC20.forceApprove(IERC20(path[0]), router, 0);
             revert("Swap failed");
         }
     }
@@ -400,8 +440,13 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
     }
 
     function _addRouter(bytes32 key, address routerAddress) internal {
-        if (routerAddress == address(0)) revert InvalidRouter();
+        if (routerAddress == address(0)) revert SwapLib.InvalidRouter();
         if (routers[key].routerAddress != address(0)) revert RouterExists();
+        
+        // Check if router address is already registered with a different key
+        if (routerAddressToKey[routerAddress] != bytes32(0)) {
+            revert RouterExists(); // Router address already exists with different key
+        }
         
         routers[key] = RouterData({
             routerAddress: routerAddress,
@@ -418,7 +463,7 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
 
     function removeRouter(bytes32 key) external onlyRole(ROUTER_MANAGER_ROLE) {
         address routerAddr = routers[key].routerAddress;
-        if (routerAddr == address(0)) revert InvalidRouter();
+        if (routerAddr == address(0)) revert SwapLib.InvalidRouter();
         
         // Remove from activeRouterKeys array
         uint256 length = activeRouterKeys.length;
@@ -439,7 +484,30 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
     // --- VIEW FUNCTIONS ---
 
     /**
-     * @notice Find best route using optimized O(1) lookups
+     * @notice Convert token amount to native token equivalent for MEV protection
+     * @dev This fixes the MEV protection bug by converting raw token amounts to native token equivalent
+     */
+    function _convertToNativeEquivalent(address token, uint256 amount) internal view returns (uint256 nativeEquivalent) {
+        if (token == WBNB || token == address(0)) {
+            return amount;
+        }
+        
+        // Create path from token to native token (WBNB)
+        address[] memory path = new address[](2);
+        path[0] = token;
+        path[1] = WBNB;
+        
+        try this.getAmountsOut(amount, path) returns (uint256[] memory amounts) {
+            return amounts[1]; // Return native token equivalent
+        } catch {
+            // If conversion fails, return a very small value to allow the transaction
+            // This prevents blocking legitimate small trades
+            return amount / 1e12; // Convert to much smaller equivalent
+        }
+    }
+
+    /**
+     * @notice Find best route using optimized O(1) lookups - supports multi-hop
      */
     function _findBestRoute(address[] calldata path, uint256 amountIn) 
         internal view returns (bytes32 bestKey, uint256 bestAmountOut) 
@@ -453,12 +521,8 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
             
             if (!routerData.isActive) continue;
             
-            uint256 expectedOut = SwapLib.getExpectedSwapOutput(
-                routerData.routerAddress,
-                path[0],
-                path[path.length - 1],
-                amountIn
-            );
+            // Use router's native getAmountsOut for multi-hop support
+            uint256 expectedOut = _getRouterAmountsOut(routerData.routerAddress, amountIn, path);
             
             if (expectedOut > bestAmountOut) {
                 bestAmountOut = expectedOut;
@@ -467,6 +531,21 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
         }
         
         if (bestAmountOut == 0) revert NoRoutersAvailable();
+    }
+    
+    /**
+     * @notice Get expected output from a specific router for multi-hop path
+     */
+    function _getRouterAmountsOut(address router, uint256 amountIn, address[] calldata path) 
+        internal view returns (uint256 amountOut) 
+    {
+        if (router == address(0) || amountIn == 0 || path.length < 2) return 0;
+        
+        try IRouterExtended(router).getAmountsOut(amountIn, path) returns (uint256[] memory amounts) {
+            return amounts.length >= 2 ? amounts[amounts.length - 1] : 0;
+        } catch {
+            return 0;
+        }
     }
 
     function getQuote(address[] calldata path, uint256 amountIn) 
@@ -530,15 +609,28 @@ contract QoraFiRouterOptimized is AccessControl, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @notice Get amounts out for a swap path
+     * @notice Get amounts out for a swap path - supports multi-hop
      */
     function getAmountsOut(uint256 amountIn, address[] calldata path) 
         external view returns (uint256[] memory amounts) 
     {
-        (, uint256 bestAmountOut) = _findBestRoute(path, amountIn);
-        amounts = new uint256[](2);
-        amounts[0] = amountIn;
-        amounts[1] = bestAmountOut;
+        (bytes32 bestRouterKey, uint256 bestAmountOut) = _findBestRoute(path, amountIn);
+        
+        if (bestRouterKey == bytes32(0) || bestAmountOut == 0) {
+            revert NoRoutersAvailable();
+        }
+        
+        address bestRouter = routers[bestRouterKey].routerAddress;
+        
+        // Get full amounts array from the best router for multi-hop paths
+        try IRouterExtended(bestRouter).getAmountsOut(amountIn, path) returns (uint256[] memory routerAmounts) {
+            amounts = routerAmounts;
+        } catch {
+            // Fallback to simple 2-element array if router doesn't support multi-hop
+            amounts = new uint256[](path.length);
+            amounts[0] = amountIn;
+            amounts[path.length - 1] = bestAmountOut;
+        }
     }
 
     /**
