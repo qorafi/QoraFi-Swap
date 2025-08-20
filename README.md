@@ -17,7 +17,7 @@ The QoraFi swap system consists of three interconnected smart contracts that wor
 │           │                       │                         │
 │           ▼                       ▼                         │
 │  ┌─────────────────┐    ┌─────────────────┐                 │
-│  │   SwapLib       │    │  QoraFiV3Handler│                 │
+│  │   SwapLib       │    │  Multi Reuters  │                 │
 │  │   MEVLib        │    │                 │                 │
 │  └─────────────────┘    └─────────────────┘                 │
 │                                                             │
