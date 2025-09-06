@@ -1,8 +1,10 @@
 # 🚀 QoraFi Aggregator - The Future of DeFi Trading
 
 <div align="center">
+    
+<img width="1024" height="1024" alt="Gemini_Generated_Image_xz7v1gxz7v1gxz7v" src="https://github.com/user-attachments/assets/8c82f47c-ac0a-42ee-99a6-52d08f0546fb" />
 
-![QoraFi Logo](https://via.placeholder.com/200x200/1E40AF/FFFFFF?text=QoraFi)
+
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Solidity](https://img.shields.io/badge/Solidity-%5E0.8.24-363636)](https://soliditylang.org/)
