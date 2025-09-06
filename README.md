@@ -721,6 +721,8 @@ QoraFi isn't just another DEX aggregator - it's the **evolution of DeFi trading*
 
 ---
 
+<div align="center">
+
 ## 📞 **Contact & Resources**
 
 ### **🔗 Quick Links**
@@ -757,3 +759,5 @@ QoraFi isn't just another DEX aggregator - it's the **evolution of DeFi trading*
 **Built with ❤️ by the QoraFi Team | © 2025 QORAFI Protocol | All rights reserved**
 
 *This project is open-source under MIT License*
+
+</div>
