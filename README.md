@@ -746,7 +746,7 @@ QoraFi isn't just another DEX aggregator - it's the **evolution of DeFi trading*
 
 ---
 
-
+<div align="center">
 
 ### **🚀 Ready to revolutionize your crypto portfolio?**
 
