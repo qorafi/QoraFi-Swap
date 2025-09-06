@@ -2,8 +2,9 @@
 
 <div align="center">
     
-<img width="1024" height="1024" alt="Gemini_Generated_Image_xz7v1gxz7v1gxz7v" src="https://github.com/user-attachments/assets/8c82f47c-ac0a-42ee-99a6-52d08f0546fb" />
 
+
+<img width="1024" height="1024" alt="QORAFI_Aggregator" src="https://github.com/user-attachments/assets/5cdab9b4-91fc-4c80-bcdc-f90c725f942c" />
 
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
